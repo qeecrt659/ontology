@@ -1,0 +1,308 @@
+---
+name: ontology-runtime-to-neo4j
+description: Use when 用户需要把 ontology runtime 的 Object 和 Link 实例数据导入 Neo4j，尤其是数据来自 CSV/JSON/表格目录，Neo4j 连接配置和 namespace 放在 .env 中，需要幂等写入、端点校验、保留属性和 lineage。
+---
+
+# Ontology Runtime 导入 Neo4j
+
+## 概览
+
+这个 skill 用于把 ontology runtime 数据导入 Neo4j。runtime 数据通常包含两类实例：
+
+- Object runtime：业务对象实例，例如 `Customer`、`Opportunity`、`Order`、`ProcessEvent`。
+- Link runtime：对象之间的关系实例，例如 `Customer_owns_Opportunity`、`Order_has_ProcessEvent`。
+
+本 skill 只提供 Markdown 执行规范，不在 skill 包内附带脚本、模板脚本或测试脚本。执行导入时可以使用项目已有工具、Neo4j Browser、`cypher-shell`、已有后端代码或一次性临时命令；不要把通用导入脚本落到这个 skill 目录，除非用户另行明确要求。
+
+## 适用场景
+
+使用本 skill：
+
+- 用户提供 ontology 的 object/link runtime 数据，并要求导入 Neo4j。
+- 用户说“把 ontology runtime 数据灌到 Neo4j”、“导入对象和关系 CSV”、“根据 .env 连接 Neo4j 并按 namespace 写入”。
+- 数据目录中有 `objects/` 与 `links/`，或有能区分 Object Type 和 Link Type 的文件清单。
+- 需要在导入前校验 link 两端对象是否存在。
+- 需要重复执行时不产生重复节点或关系。
+
+不使用本 skill：
+
+- 用户只是要设计 Palantir Ontology，不涉及 Neo4j runtime 落库。
+- 用户只要从数据库抽取 eventlog 或 ontology CSV，不要求写入 Neo4j。
+- 用户要求生成长期维护的导入程序；那是代码实现任务，不是这个纯 Markdown skill 的范围。
+
+## 输入约定
+
+执行前先确认四类输入。
+
+| 输入 | 必需性 | 要求 |
+| --- | --- | --- |
+| Object runtime 数据 | 必需 | CSV/JSON/表格均可；每行代表一个对象实例。 |
+| Link runtime 数据 | 必需 | 每行代表一条关系实例，必须能识别 source、target 和 link type。 |
+| `.env` | 必需 | 存放 Neo4j 连接信息、database 和 namespace。 |
+| 类型映射说明 | 可选 | 当文件名或字段名无法推断 Object Type / Link Type 时由用户提供。 |
+
+推荐 `.env` 字段：
+
+```dotenv
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=neo4j
+ONTOLOGY_NAMESPACE=your_namespace
+```
+
+兼容读取常见别名：
+
+| 标准字段 | 可接受别名 |
+| --- | --- |
+| `NEO4J_URI` | `NEO4J_URL`, `NEO4J_BOLT_URI`, `bolt_uri`, `uri` |
+| `NEO4J_USERNAME` | `NEO4J_USER`, `username`, `user` |
+| `NEO4J_PASSWORD` | `password` |
+| `NEO4J_DATABASE` | `database` |
+| `ONTOLOGY_NAMESPACE` | `NEO4J_NAMESPACE`, `namespace` |
+
+读取 `.env` 时不要在对话、日志或报告里输出密码原文。只报告字段是否存在。
+
+## Runtime 数据字段
+
+### Object 行
+
+每个 Object 行至少需要：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_id` | 对象在该 Object Type 内的稳定主键。 |
+| Object Type | 优先来自字段 `object_type`、`ontology_object_type`；没有则从文件名推断。 |
+
+如果没有 `object_id`，按以下顺序处理：
+
+1. 查找用户提供的主键映射。
+2. 使用明显的业务键，例如 `customerCode`、`opportunityCode`、`orderNo`。
+3. 仍无法确定时停止导入，要求用户补充主键规则。
+
+### Link 行
+
+每个 Link 行至少需要：
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_id` | 起点对象主键。 |
+| `target_id` | 终点对象主键。 |
+| `source_object_type` | 起点 Object Type。 |
+| `target_object_type` | 终点 Object Type。 |
+| Link Type | 优先来自字段 `link_type`、`link_type_name`；没有则从文件名推断。 |
+
+如果缺少 `link_id`，按以下规则派生稳定关系主键：
+
+```text
+<namespace>|<link_type>|<source_object_type>|<source_id>|<target_object_type>|<target_id>
+```
+
+## Neo4j 图模型
+
+使用 namespace 隔离不同批次或不同 ontology 的 runtime 数据。节点和关系都要写入 `ontology_namespace`。
+
+节点模型：
+
+```cypher
+(:OntologyObject:<ObjectType> {
+  ontology_key: "<namespace>|<ObjectType>|<object_id>",
+  ontology_namespace: "<namespace>",
+  object_type: "<ObjectType>",
+  object_id: "<object_id>",
+  ...
+})
+```
+
+关系模型：
+
+```cypher
+(:OntologyObject)-[:<LinkType> {
+  ontology_key: "<namespace>|<link_type>|<source_type>|<source_id>|<target_type>|<target_id>",
+  ontology_namespace: "<namespace>",
+  link_type: "<LinkType>",
+  source_object_type: "<source_type>",
+  source_id: "<source_id>",
+  target_object_type: "<target_type>",
+  target_id: "<target_id>",
+  ...
+}]->(:OntologyObject)
+```
+
+Neo4j label 和 relationship type 不是普通参数，写入前必须清洗：
+
+- 只允许字母、数字和下划线。
+- 首字符不能是数字。
+- 空值或无法清洗的名称必须停止并要求用户提供映射。
+- 不要把中文名、空格、连字符、斜杠直接作为 label 或 relationship type。
+
+用户可见中文语义字段可以保留为属性，例如 `object_label`、`link_type_name`、`relationship_semantics`。
+
+## 执行流程
+
+### 1. 读取配置
+
+读取 `.env` 并确认：
+
+- Neo4j URI 存在。
+- 用户名存在。
+- 密码存在但不打印。
+- database 存在；没有则使用 `neo4j` 并说明默认值。
+- namespace 存在；没有 namespace 时停止，不要把数据写入默认空命名空间。
+
+### 2. 盘点数据
+
+对 object/link 数据做导入前盘点：
+
+- 列出 Object Type、文件名、行数、主键字段。
+- 列出 Link Type、文件名、行数、source type、target type。
+- 识别空文件；空 Object 或 Link 文件不报错，但需要在报告中标为 warning。
+- 抽样检查字段名是否稳定，避免同一类型多个文件字段冲突。
+
+### 3. 校验 link 端点
+
+先构建所有 object 的逻辑键：
+
+```text
+<namespace>|<ObjectType>|<object_id>
+```
+
+再对每条 link 校验：
+
+- source key 是否存在于 object 集合。
+- target key 是否存在于 object 集合。
+- source/target type 是否可清洗为安全 Neo4j 标识符。
+- link type 是否可清洗为安全 Neo4j relationship type。
+
+默认策略：只要存在缺失端点，就停止导入并报告缺失样例。只有用户明确接受部分导入时，才跳过缺失端点的 link。
+
+### 4. 创建约束
+
+优先创建统一对象唯一约束：
+
+```cypher
+CREATE CONSTRAINT ontology_object_key IF NOT EXISTS
+FOR (n:OntologyObject)
+REQUIRE n.ontology_key IS UNIQUE;
+```
+
+如果 Neo4j 版本支持 relationship property uniqueness，可为每种 Link Type 创建关系唯一约束：
+
+```cypher
+CREATE CONSTRAINT rel_<LinkType>_key IF NOT EXISTS
+FOR ()-[r:<LinkType>]-()
+REQUIRE r.ontology_key IS UNIQUE;
+```
+
+如果版本不支持关系唯一约束，仍然使用 `MERGE` 按 `ontology_key` 幂等写入关系，并在报告中说明关系唯一性由导入语句保证。
+
+### 5. 导入 Object
+
+先导入全部 Object，再导入 Link。对象写入必须幂等：
+
+```cypher
+MERGE (n:OntologyObject:<ObjectType> {ontology_key: $ontology_key})
+SET n += $properties
+SET n.ontology_namespace = $namespace,
+    n.object_type = $object_type,
+    n.object_id = $object_id;
+```
+
+属性处理规则：
+
+- 第一版导入默认按字符串保留原始值，避免金额、日期、JSON 字段解析失败导致整批失败。
+- 空字符串可以保留为空字符串；如果用户要求清理，再统一移除空属性。
+- lineage/audit 字段必须保留，例如 `source_event_ids`、`source_case_ids`、`source_tables`、`source_pks`、`first_event_time`、`last_event_time`。
+- 不要覆盖 Neo4j 内部字段名；如遇冲突，给属性加前缀或要求用户确认映射。
+
+### 6. 导入 Link
+
+Link 写入前必须匹配两端对象：
+
+```cypher
+MATCH (s:OntologyObject {ontology_key: $source_key})
+MATCH (t:OntologyObject {ontology_key: $target_key})
+MERGE (s)-[r:<LinkType> {ontology_key: $link_key}]->(t)
+SET r += $properties
+SET r.ontology_namespace = $namespace,
+    r.link_type = $link_type,
+    r.source_object_type = $source_object_type,
+    r.source_id = $source_id,
+    r.target_object_type = $target_object_type,
+    r.target_id = $target_id;
+```
+
+不要为了补齐 link 自动创建缺失端点对象。缺失端点代表数据质量问题，默认应停止并报告。
+
+### 7. 执行质量检查
+
+导入后至少执行这些检查：
+
+```cypher
+MATCH (n:OntologyObject {ontology_namespace: $namespace})
+RETURN n.object_type AS object_type, count(*) AS count
+ORDER BY count DESC;
+```
+
+```cypher
+MATCH ()-[r {ontology_namespace: $namespace}]->()
+RETURN r.link_type AS link_type, count(*) AS count
+ORDER BY count DESC;
+```
+
+```cypher
+MATCH (n:OntologyObject {ontology_namespace: $namespace})
+WHERE NOT (n)--()
+RETURN n.object_type AS object_type, n.object_id AS object_id
+LIMIT 100;
+```
+
+如存在 `ProcessEvent`，检查事件是否能追溯到业务对象：
+
+```cypher
+MATCH (e:OntologyObject:ProcessEvent {ontology_namespace: $namespace})
+OPTIONAL MATCH (e)<-[r {ontology_namespace: $namespace}]-(o:OntologyObject)
+RETURN count(e) AS event_count, count(o) AS event_with_incoming_object_count;
+```
+
+## 批处理与安全
+
+- 大数据量按批提交，建议每批 500 到 5000 行；根据 Neo4j 实例内存调整。
+- 不要在没有用户明确要求时删除 Neo4j 中已有数据。
+- 不要执行 `DETACH DELETE`、全库清空或跨 namespace 删除。
+- 如果用户要求重跑某个 namespace，先给出将影响的节点数和关系数，并要求明确确认。
+- 不要把 `.env` 密码、完整连接串中的凭证、脱敏前敏感字段输出到报告。
+- 导入失败时保留已完成批次，不做自动删除；报告失败批次、错误信息和可重试策略。
+
+## 最终报告
+
+导入完成后，用中文给出简洁报告：
+
+```markdown
+## Neo4j 导入结果
+
+- namespace：`<namespace>`
+- database：`<database>`
+- Object Type 数：`<n>`
+- Object 行数：`<n>`
+- Link Type 数：`<n>`
+- Link 行数：`<n>`
+- 跳过的空文件：`<list 或 无>`
+- 缺失端点：`0` 或 `<n>`，并列出前 10 条
+- 约束/索引：`已创建/已存在/跳过原因`
+- 质量检查：节点计数、关系计数、孤立节点检查结果
+- 注意事项：字段类型化、部分导入、权限或性能风险
+```
+
+如果没有实际执行导入，只做了 dry run，也要明确写成“未写入 Neo4j，只完成导入前检查”。
+
+## 常见错误
+
+| 问题 | 处理 |
+| --- | --- |
+| `.env` 没有 namespace | 停止导入，要求补充 namespace。 |
+| link 缺少 source/target type | 从用户映射或文件名推断；无法推断则停止。 |
+| link 端点不存在 | 默认停止，不自动创建占位对象。 |
+| 中文 Link Type 直接作为关系类型 | 清洗或映射为英文/安全标识符，中文语义保留为属性。 |
+| 重复导入产生重复数据 | 使用 `ontology_key` 做 `MERGE`，不要用随机 ID。 |
+| 日期或金额解析失败 | 第一版按字符串导入，后续再派生类型化字段。 |
