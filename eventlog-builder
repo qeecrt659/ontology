@@ -1,0 +1,977 @@
+---
+name: eventlog-builder
+description: Use when 用户需要从关系型数据库、业务系统表、日志表或审计表生成 process mining eventlog/event log，尤其是没有显式外键、需要推断逻辑表关系、设计 case/activity/timestamp/resource、尽量完整保留有业务含义的源字段为 eventlog 属性列、为 object type 罗列并验证可从 eventlog 获取的业务属性，或最终导出 eventlog.csv。
+---
+
+# Eventlog 构建器
+
+## 概述
+
+使用本技能从业务系统数据中生成流程挖掘 eventlog。重点不是某个特定系统，而是一套通用方法：**先分析数据表之间的逻辑关系和字段语义，再设计 case、activity、timestamp、resource 和业务属性，最后导出可用于流程挖掘工具的 `eventlog.csv`。**
+
+适用数据源包括但不限于：
+
+```text
+CRM / ERP / SCM / OA / 工单系统 / 审批系统 / 采购系统 / 订单系统
+制造执行系统 / 仓储物流系统 / 财务系统 / 医疗业务系统 / 客服系统
+PostgreSQL / MySQL / SQL Server / Oracle / SQLite / CSV / Parquet
+```
+
+推荐工作流：
+
+```text
+理解流程目标
+  -> 盘点源表和字段
+  -> 分析候选主键/业务键
+  -> 推断并验证逻辑表关系
+  -> 选择 case 粒度
+  -> 建立 case bridge
+  -> 识别事件来源和 activity 规则
+  -> 判断业务字段是否提升为 eventlog 列
+  -> 罗列 object type 业务属性并验证 eventlog 可获取性
+  -> 生成 eventlog 表/视图
+  -> 按 case 抽样导出 eventlog.csv
+  -> 做质量校验
+```
+
+## 适用场景
+
+当用户需要做以下事情时使用本技能：
+
+- 从数据库表、业务日志、审批日志、状态历史表、审计表生成 eventlog
+- 为流程挖掘工具准备 `case_id`、`activity`、`event_time`、`resource` 等字段
+- 数据库没有显式外键，需要通过 `id`、`code`、`no`、`business_key` 等字段推断逻辑关系
+- 判断哪些表是 case 主表，哪些表是事件来源，哪些表只是维度或属性
+- 将当前状态、字段历史、审批任务、业务时间点转成事件
+- 将源表中有业务含义的字段提升为 eventlog 列
+- 为后续 ontology / object type 设计罗列业务属性，并验证这些属性能否从 eventlog 表或 `eventlog.csv` 中获取
+- 按用户要求或默认规则导出抽样 `eventlog.csv`
+
+不要把本技能用于普通 SQL 调优、数据库迁移，或与流程挖掘/eventlog 无关的数据建模。
+
+## 核心原则
+
+1. **先关系，后事件**
+   没有表关系分析就直接 union 事件，会导致 case 串错、重复和轨迹污染。
+
+2. **当前状态不是历史事件**
+   `status`、`stage`、`state` 这类当前字段通常只能表示现在，除非有时间戳或历史表支撑，否则不能还原完整流程。
+
+3. **属性列尽量完整**
+   推荐 eventlog 格式只是最低基线，不是列数上限。源表中有业务含义、可解释流程差异、可用于筛选/分组/对比/审计/根因分析的字段，都应尽量作为 eventlog 属性列输出。
+
+4. **弱关系要标记，不要强连**
+   低覆盖率、语义不清或跨系统历史数据应隔离，或作为单独 case 类型处理。
+
+5. **最终必须能落地为 CSV**
+   方案的最终交付物是抽样后的 `eventlog.csv`。如果用户没指定抽样规模，默认抽样 2000 个 case，并保留这些 case 的完整事件轨迹；不再默认导出全量数据。
+
+6. **抽样单位优先是 case，不是 event 行**
+   流程挖掘样本必须尽量保持轨迹完整。不要默认用 `limit` 截断 event 行；应先抽取 `case_id`，再导出被抽中 case 的全部事件。行级 `limit` 只能用于 CSV 格式预览，不能作为流程分析样本。
+
+7. **Object type 属性必须可验证**
+   如果输出中包含 object type 或面向 ontology 的对象设计，必须列出每个 object type 应含有的业务属性，并逐项验证这些属性能从 eventlog 的列、`attributes`、或基于 eventlog 的确定性聚合规则中获取。无法从 eventlog 获取的属性必须标记为缺口，不能写成已具备属性。
+
+## 1. 明确流程目标
+
+先问或推断用户要分析的流程是什么。流程目标决定 case 粒度和事件边界。
+
+常见目标：
+
+| 流程目标 | 可能 case | 典型 activity |
+|---|---|---|
+| 销售过程 | 商机、报价、合同 | 创建商机、阶段变更、提交报价、签约 |
+| 采购过程 | 采购申请、采购订单 | 创建申请、审批、下单、收货、付款 |
+| 订单履约 | 订单、发货单 | 下单、审核、拣货、发货、签收 |
+| 工单处理 | 工单、问题单 | 创建、分派、处理中、解决、关闭 |
+| 审批流程 | 审批单、业务单据 | 提交、节点开始、节点完成、驳回 |
+| 制造流程 | 生产订单、批次 | 下达、开工、质检、完工、入库 |
+
+如果业务目标不清，先给出 2-3 个可选 case 粒度，并说明分析差异。
+
+## 2. 盘点源表和字段
+
+按角色给表分类：
+
+| 表角色 | 判断依据 | 示例 |
+|---|---|---|
+| case 主表 | 一行代表一个流程实例或核心业务对象 | order、ticket、case、application |
+| 事件历史表 | 多行记录同一对象的状态/字段变化 | status_history、field_history、audit_log |
+| 审批/任务日志 | 有节点、处理人、开始/结束时间 | approval_log、workflow_task |
+| 明细表 | 多行从属于主对象，不一定是事件 | order_line、item_detail |
+| 维度表 | 提供名称、组织、用户、产品解释 | user、department、product |
+| 外部同步表 | 来自下游或历史系统，可能弱关联 | erp_sync、contract_sync |
+
+每张表采集：
+
+```text
+行数
+字段列表
+字段类型
+字段注释
+主键/唯一键
+候选业务键
+时间字段
+状态/阶段字段
+人员/资源字段
+金额/数量/组织/产品等业务字段
+```
+
+## 3. 分析候选主键和业务键
+
+不要假设字段唯一。对每个候选键计算：
+
+```text
+非空行数
+distinct 数
+唯一性 = distinct / 非空行数
+是否有重复
+是否跨表匹配
+```
+
+常见候选键：
+
+```text
+id
+case_id
+business_id
+application_id / application_no
+order_id / order_no
+ticket_id / ticket_no
+customer_id / customer_code
+opportunity_id / opportunity_code
+contract_id / contract_no
+process_instance_id
+task_id
+batch_id
+```
+
+键分类：
+
+| 分类 | 标准 | 用途 |
+|---|---|---|
+| 技术主键 | 声明 PK 或 100% 唯一非空 | `source_pk`、内部 join |
+| 强业务键 | 业务稳定，唯一或接近唯一 | `case_id` 候选 |
+| 弱业务键 | 会重复，但可多对一关联 | bridge 或属性 |
+| 不安全键 | 空值高、覆盖低、语义不清 | 排除或人工确认 |
+
+## 4. 推断并验证逻辑表关系
+
+数据库没有显式外键时，用字段名、字段注释、业务语义和覆盖率共同判断关系。
+
+先列出候选关系：
+
+```text
+child_table.child_column -> parent_table.parent_column
+```
+
+然后计算覆盖率。推荐使用 `exists`，避免父表重复键放大 join 结果：
+
+```sql
+select
+  count(*) filter (
+    where c.child_key is not null and c.child_key::text <> ''
+  ) as child_nonnull_rows,
+  count(*) filter (
+    where c.child_key is not null and c.child_key::text <> ''
+      and exists (
+        select 1
+        from parent_table p
+        where p.parent_key = c.child_key
+      )
+  ) as matched_rows,
+  count(distinct c.child_key) filter (
+    where c.child_key is not null and c.child_key::text <> ''
+  ) as child_distinct_keys,
+  count(distinct c.child_key) filter (
+    where c.child_key is not null and c.child_key::text <> ''
+      and exists (
+        select 1
+        from parent_table p
+        where p.parent_key = c.child_key
+      )
+  ) as matched_distinct_keys
+from child_table c;
+```
+
+关系置信度：
+
+| 置信度 | 典型标准 | 处理 |
+|---|---|---|
+| high | 行覆盖率和 key 覆盖率通常高于 95%，语义一致 | 默认进入主 eventlog |
+| medium | 覆盖率约 70%-95%，或业务上明确是部分流程 | 进入 eventlog，但标记置信度 |
+| low | 覆盖率低、语义不清、跨历史系统或同步边界 | 隔离、单独建 case 或排除 |
+
+记录关系图，而不是只写在 SQL 里：
+
+```sql
+create table eventlog_relation_map (
+  relation_id bigserial primary key,
+  child_schema text,
+  child_table text not null,
+  child_column text not null,
+  parent_schema text,
+  parent_table text not null,
+  parent_column text not null,
+  relation_type text not null,
+  confidence text not null,
+  row_coverage numeric,
+  key_coverage numeric,
+  route_condition text,
+  enabled boolean default true,
+  comment text
+);
+```
+
+## 5. 选择 case 粒度
+
+case 是流程挖掘里的流程实例。选择错误 case 粒度会让流程图失真。
+
+选择标准：
+
+```text
+一条 case 应代表一个可完整追踪的业务对象
+case_id 应稳定、可解释、尽量唯一
+case 内事件应有自然先后顺序
+case 不应把多个无关对象强行合并
+```
+
+常见 case 粒度：
+
+| 场景 | case_id 示例 |
+|---|---|
+| 订单流程 | `order:{order_no}` |
+| 采购流程 | `purchase:{purchase_request_no}` |
+| 审批流程 | `approval:{process_instance_id}` |
+| 工单流程 | `ticket:{ticket_no}` |
+| 生产流程 | `work_order:{work_order_no}` |
+| 合同流程 | `contract:{contract_no}` |
+| 客户/商机流程 | `customer:{customer_code}` / `opportunity:{opportunity_code}` |
+
+如果一个系统天然有多层对象，例如客户 -> 商机 -> 合同 -> 订单，不要盲目合并。可以设计多个 case 类型，并通过 `parent_case_id` 或 bridge 表表达关系。
+
+## 6. 建立 case bridge
+
+case bridge 的作用是：先把每个来源表的每一行映射到某个 case，再统一生成事件。
+
+推荐结构：
+
+```sql
+create table eventlog_case_bridge (
+  bridge_id bigserial primary key,
+  case_type text not null,
+  case_id text not null,
+  parent_case_id text,
+  source_schema text,
+  source_table text not null,
+  source_pk text not null,
+  business_key text,
+  relation_path text not null,
+  relation_confidence text not null,
+  created_at timestamp default now()
+);
+```
+
+复杂日志必须通过路由规则，而不是简单 join。例如审批日志：
+
+```text
+approval_log.process_key + approval_log.business_id
+  -> 对应业务表.id
+  -> 业务表.case_key
+```
+
+如果同一个 `business_id` 在不同 `process_key` 下代表不同业务表，必须按 `process_key` 分支处理。
+
+## 7. 识别事件来源和 activity
+
+eventlog 最小三要素：
+
+```text
+case_id
+activity
+event_time
+```
+
+推荐补充：
+
+```text
+resource
+lifecycle
+source_table
+source_pk
+relation_path
+relation_confidence
+业务字段列
+attributes
+```
+
+activity 不是从固定表类型、固定字段名或当前状态值里直接“获取”的字段。它只能在源数据足以表达一个已发生业务动作时被生成；核心约束是：**先查看表中记录时间的列，再判断当前时间列和当前数据行能否共同构成一个 activity**。
+
+
+### 7.1 Activity 合格标准
+
+一个 activity 规则合格，应满足：
+
+```text
+1. 有明确事件时间
+2. 能映射到 case_id
+3. 表示业务动作，而不是单纯字段值
+4. 名称稳定，不混入人员、金额、地区等变量
+5. 能追溯 source_table 和 source_pk
+6. 相关业务字段作为 eventlog 属性列保留
+7. 不把当前状态误当历史事件
+8. 不造成不必要的事件膨胀
+```
+
+## 8. 属性列完整性和业务字段入列规则
+
+源表字段如果有明确业务含义，并且对流程分析、筛选、分组、变体比较、绩效分析、合规审计、瓶颈定位或业务解释有价值，应尽量提升为 eventlog 的属性列，而不是只放进 `attributes` JSON。
+
+**推荐 eventlog schema 是最低基线，不是格式限制。** 生成 eventlog 时，应基于实际源表字段动态扩展列，尽量完整保留可分析的业务属性。不要因为推荐结构里没有某个字段，就丢弃该字段或只放入 JSON。
+
+优先入列的字段类型：
+
+| 字段类型 | 例子 | 推荐列 |
+|---|---|---|
+| 业务对象标识 | `order_no`、`ticket_no`、`contract_no`、`application_no` | 同名标准列 |
+| 组织维度 | `region_code`、`department_id`、`office_code`、`tenant_id` | 组织/租户列 |
+| 人员/资源 | `owner_id`、`creator`、`updater`、`approver`、`handler` | `resource_id`、`owner_id`、`approver_id` |
+| 状态/阶段 | `status`、`state`、`stage`、`approval_status` | `status`、`stage_code`、`stage_name` |
+| 业务类型 | `business_type`、`process_type`、`order_type`、`contract_type` | 类型列 |
+| 金额/数量 | `amount`、`price`、`cost`、`quantity` | 指标列 |
+| 时间计划 | `planned_time`、`due_date`、`promise_date` | 计划/承诺时间列 |
+| 风险/合规 | `risk_level`、`compliance_status`、`control_type` | 风险/合规列 |
+| 产品/物料 | `product_code`、`item_code`、`material_code` | 产品/物料列 |
+
+判断规则：
+
+```text
+会被流程挖掘工具用于筛选、分组、对比、绩效分析、合规分析、瓶颈解释的字段 -> eventlog 列
+能解释 case 差异、activity 差异、耗时差异、返工差异、审批差异的字段 -> eventlog 列
+与业务对象、组织、人员、状态、类型、金额、数量、风险、产品、地区、渠道、优先级有关的字段 -> eventlog 列
+只用于回溯原始记录、长文本、原始 JSON、极低填充率扩展、不稳定结构的字段 -> attributes
+无业务意义、重复技术字段、敏感且不应输出的字段 -> 排除或脱敏
+```
+
+字段入列优先级：
+
+| 优先级 | 处理 |
+|---|---|
+| 必须入列 | eventlog 三要素、source 追溯字段、case 业务键、核心时间/人员/状态字段 |
+| 尽量入列 | 有业务含义的维度、指标、类型、组织、产品、风险、地区、渠道字段 |
+| 可放 attributes | 长文本、备注、原始 payload、低频扩展、结构变化大的字段 |
+| 排除/脱敏 | 密码、密钥、敏感个人信息、无解释价值的技术噪声 |
+
+当用户要求“属性列尽量全”或未给出列数限制时，默认策略是：
+
+```text
+保留所有可识别业务含义的字段为 eventlog 列；
+列名做规范化，避免冲突；
+原始字段仍可在 attributes 中保留一份用于追溯；
+只有明确无业务价值、敏感、不可稳定结构化或会造成严重重复膨胀的字段才不入列。
+```
+
+推荐记录字段映射：
+
+```sql
+create table eventlog_business_field_map (
+  field_map_id bigserial primary key,
+  source_schema text,
+  source_table text not null,
+  source_column text not null,
+  eventlog_column text not null,
+  business_meaning text not null,
+  column_role text not null,
+  required boolean default false,
+  enabled boolean default true,
+  comment text
+);
+```
+
+常见 `column_role`：
+
+```text
+case_identifier
+business_identifier
+organization_dimension
+resource_dimension
+status_dimension
+amount_metric
+quantity_metric
+time_dimension
+risk_dimension
+product_dimension
+case_attribute
+event_attribute
+```
+
+字段映射表应覆盖每个进入 eventlog 的来源表。对每个源字段给出处理结论：
+
+```text
+promote_to_column：提升为 eventlog 列
+keep_in_attributes：保留在 attributes
+exclude：排除
+mask_or_hash：脱敏或哈希后输出
+```
+
+### 8.1 Object Type 业务属性清单和可获取性验证
+
+当用户要求 object type、ontology、对象建模，或 eventlog 后续会用于抽取对象实例时，必须在 eventlog 设计阶段同步产出 object type 属性清单。这里的 object type 通常来自 case 主对象、可稳定识别的业务对象、资源对象、组织对象、产品/物料对象、供应商/客户对象等。
+
+不要只写 object type 名称。每个 object type 都必须说明它应该含有哪些业务属性，以及这些属性是否能从当前 eventlog 中获得。
+
+推荐输出字段：
+
+| 字段 | 含义 |
+|---|---|
+| `object_type` | 对象类型名称，例如 `Order`、`Ticket`、`ApprovalTask`、`Customer` |
+| `object_id_rule` | 对象实例 ID 生成规则，例如 `case_id`、`customer:{customer_id}` |
+| `attribute_name` | 对象业务属性名 |
+| `data_type` | 建议数据类型 |
+| `business_meaning` | 业务含义和分析用途 |
+| `required` | 是否为该 object type 的核心属性 |
+| `eventlog_source` | `eventlog` 中的来源列、`attributes` key，或聚合表达式 |
+| `extraction_rule` | 提取规则，例如 `latest_non_null`、`first_non_null`、`min`、`max`、`sum`、`count_distinct` |
+| `availability_status` | `available`、`partial`、`missing`、`derived`、`requires_join` |
+| `nonnull_rate` | 按对象实例聚合后的非空率 |
+| `validation_sql` | 用于验证该属性可获取性的 SQL 或脚本名 |
+| `gap_reason` | 缺失或部分可用时的原因 |
+
+推荐建立对象属性映射表：
+
+```sql
+create table eventlog_object_attribute_map (
+  object_attr_id bigserial primary key,
+  object_type text not null,
+  object_id_rule text not null,
+  attribute_name text not null,
+  data_type text,
+  business_meaning text not null,
+  required boolean default false,
+  eventlog_source text not null,
+  extraction_rule text not null,
+  availability_status text not null,
+  nonnull_rate numeric,
+  distinct_count integer,
+  sample_values text,
+  validation_sql text,
+  gap_reason text,
+  enabled boolean default true,
+  comment text
+);
+```
+
+Object type 属性优先从已提升为 eventlog 列的业务字段获取。只有在字段结构不稳定、极低填充率、长文本或原始 payload 的情况下，才从 `attributes` 中提取；如果只能通过回连源表或维度表获取，应标记为 `requires_join`，并说明当前 eventlog 本身不能直接提供该属性。
+
+常见 object type 属性：
+
+| Object type 类别 | 应优先考虑的业务属性 |
+|---|---|
+| case 主对象 | 业务编号、状态、阶段、类型、优先级、渠道、地区、组织、负责人、创建时间、完成时间、SLA、金额、数量、风险等级 |
+| 审批/任务对象 | 节点名称、任务类型、处理人、角色、审批结果、驳回原因、开始时间、完成时间、处理时长、审批层级 |
+| 客户/供应商对象 | 编码、名称、分层、行业、区域、负责人、风险状态、信用等级 |
+| 组织对象 | 组织编码、组织名称、上级组织、区域、租户、成本中心 |
+| 产品/物料对象 | 编码、名称、品类、规格、批次、单位、项目编码 |
+| 资源/人员对象 | 人员 ID、姓名、角色、部门、岗位、租户 |
+
+验证规则：
+
+```text
+每个 object type 必须有 object_id 生成规则，并能从 eventlog 中计算出实例数。
+每个属性必须标明 eventlog_source，不能只写业务上“应该有”。
+如果属性来自事件级字段，必须说明如何聚合为对象级属性。
+如果同一对象同一属性存在多个值，必须说明取值规则和冲突数量。
+如果非空率低于可用阈值，应标记 partial，并解释是否受流程分支、历史数据或采集缺口影响。
+如果 eventlog 中没有来源列或 attributes key，应标记 missing，不要把它写入可交付属性。
+敏感属性即使可获取，也要标记 mask_or_hash 或排除策略。
+```
+
+对象级属性验证示例：
+
+```sql
+-- 验证 case 主对象属性能否从 eventlog 聚合获取
+with base_events as (
+  select
+    e.*,
+    row_number() over (
+      partition by e.case_type, e.case_id
+      order by e.event_time desc, e.event_order desc, e.source_table desc, e.source_pk desc
+    ) as latest_rank
+  from eventlog e
+  where e.case_id is not null
+),
+object_attributes as (
+  select
+    case_type as object_type,
+    case_id as object_id,
+    max(business_key) filter (where business_key is not null) as business_key,
+    min(event_time) as first_event_time,
+    max(event_time) as last_event_time,
+    max(organization_id) filter (where organization_id is not null) as organization_id,
+    max(amount) filter (where amount is not null) as amount
+  from base_events
+  group by case_type, case_id
+),
+latest_attributes as (
+  select
+    case_type as object_type,
+    case_id as object_id,
+    status as latest_status
+  from base_events
+  where latest_rank = 1
+)
+select
+  oa.object_type,
+  count(*) as object_count,
+  count(*) filter (where oa.business_key is not null) as with_business_key,
+  round(count(*) filter (where oa.business_key is not null)::numeric / nullif(count(*), 0), 4) as business_key_nonnull_rate,
+  count(*) filter (where la.latest_status is not null) as with_latest_status,
+  round(count(*) filter (where la.latest_status is not null)::numeric / nullif(count(*), 0), 4) as latest_status_nonnull_rate,
+  count(*) filter (where oa.organization_id is not null) as with_organization_id,
+  round(count(*) filter (where oa.organization_id is not null)::numeric / nullif(count(*), 0), 4) as organization_id_nonnull_rate,
+  count(*) filter (where oa.amount is not null) as with_amount,
+  round(count(*) filter (where oa.amount is not null)::numeric / nullif(count(*), 0), 4) as amount_nonnull_rate
+from object_attributes oa
+left join latest_attributes la
+  on la.object_type = oa.object_type
+ and la.object_id = oa.object_id
+group by oa.object_type;
+```
+
+如果目标数据库不支持窗口函数或 `filter` 语法，应使用等价 SQL 或脚本验证，但必须保留同样的验证含义：对象实例数、属性非空率、来源列、取值规则和缺口原因。
+
+对象属性清单示例：
+
+| object_type | attribute_name | eventlog_source | extraction_rule | availability_status | 验证结论 |
+|---|---|---|---|---|---|
+| `Order` | `order_no` | `business_key` 或 `order_no` | `first_non_null` | `available` | 可从每个订单 case 聚合获取 |
+| `Order` | `latest_status` | `status` | `latest_non_null by event_time` | `derived` | 可由事件序列计算当前可见状态 |
+| `Order` | `amount` | `amount` | `max_non_null` | `partial` | 仅部分订单事件带金额，需要报告非空率 |
+| `Customer` | `customer_name` | 无稳定列 | `none` | `missing` | 当前 eventlog 不包含客户名称，需要源表或维度表补充 |
+
+## 9. 生成 eventlog 表或视图
+
+下面结构是通用最低基线。实际项目中应在此基础上追加业务属性列，列数不限于该推荐格式。只要字段有稳定业务含义且有助于流程分析，就应加入 eventlog schema。
+
+```sql
+create table eventlog (
+  event_id text primary key,
+  case_id text not null,
+  case_type text not null,
+  parent_case_id text,
+  activity text not null,
+  activity_group text,
+  event_time timestamp not null,
+  lifecycle text,
+  resource_id text,
+  resource_name text,
+  owner_id text,
+  approver_id text,
+  role_name text,
+  status text,
+  stage_code text,
+  stage_name text,
+  business_type text,
+  process_type text,
+  event_order integer not null,
+  source_system text,
+  source_schema text,
+  source_table text not null,
+  source_pk text not null,
+  relation_path text,
+  relation_confidence text,
+  business_key text,
+  organization_id text,
+  organization_name text,
+  product_code text,
+  product_name text,
+  amount numeric,
+  quantity numeric,
+  currency_code text,
+  risk_status text,
+  compliance_status text,
+  tenant_id text,
+  attributes jsonb,
+  extracted_at timestamp default now()
+);
+```
+
+可动态追加的属性列示例：
+
+```text
+priority
+channel
+region
+department
+customer_segment
+supplier_code
+material_code
+item_category
+payment_terms
+shipping_type
+risk_level
+sla_level
+reject_reason
+return_reason
+approval_level
+cost_center
+project_code
+batch_no
+```
+
+列设计要求：
+
+```text
+推荐列 = 最低要求
+业务属性列 = 根据源表字段尽量扩展
+不同来源表同义字段应归并到统一列，例如 handler/user/approver -> resource_id 或 approver_id
+同名但语义不同的字段必须加前缀，例如 order_status、payment_status
+源字段单位不一致时要标准化列名和单位，例如 amount、amount_currency
+```
+
+每条事件 SQL 都应：
+
+```text
+通过 case_bridge 获取 case_id
+明确 activity 生成逻辑
+明确 event_time 来源
+写入 source_table/source_pk
+写入 relation_path/relation_confidence
+把有业务含义的字段尽量写入 eventlog 属性列
+保留后续 object type 属性抽取所需的业务键、组织、人员、状态、类型、金额、产品、风险等列
+无法稳定结构化、低价值或长文本扩展字段写入 attributes
+```
+
+示例：
+
+```sql
+select
+  'status_history:' || h.id as event_id,
+  b.case_id,
+  b.case_type,
+  '进入状态：' || h.new_status_name as activity,
+  '状态流转' as activity_group,
+  h.change_time as event_time,
+  'complete' as lifecycle,
+  h.changed_by as resource_id,
+  h.new_status as status,
+  20 as event_order,
+  'status_history' as source_table,
+  h.id::text as source_pk,
+  b.relation_path,
+  b.relation_confidence,
+  h.business_key,
+  h.department_id as organization_id,
+  h.amount,
+  h.tenant_id::text as tenant_id,
+  jsonb_build_object(
+    'old_status', h.old_status,
+    'new_status', h.new_status,
+    'comment', h.comment,
+    'all_source_columns_not_promoted', '根据字段映射表保留未入列字段'
+  ) as attributes
+from status_history h
+join eventlog_case_bridge b
+  on b.source_table = 'status_history'
+ and b.source_pk = h.id::text
+where h.change_time is not null;
+```
+
+## 10. 导出 eventlog.csv
+
+最终交付物必须包含一个名为 `eventlog.csv` 的文件，除非用户明确指定其他文件名。该文件默认是抽样数据，不再默认导出全量 eventlog。
+
+抽样规则：
+
+```text
+如果用户没有指定抽样规模，默认抽样 2000 个 case。
+如果用户指定“抽样 N 个案例 / case / 流程实例”，按 N 个 case 抽样。
+如果用户指定“抽样 N 行 / 导出 N 行”，优先解释为生成接近 N 行的完整 case 样本，而不是截断单个 case。
+只有用户明确说“只要前 N 行预览格式”时，才允许使用 event 行 limit；该结果必须标记为 row_preview，不能作为流程挖掘样本。
+```
+
+默认导出方式是先抽取 case，再导出这些 case 的完整事件轨迹。抽样必须可复现，随机抽样时固定 `random_seed`，并在报告中记录抽样方法、抽样单位、请求 case 数、实际 case 数、实际 event 行数和过滤条件。
+
+推荐建立样本 case 表：
+
+```sql
+create table eventlog_sample_case (
+  sample_id text not null,
+  case_id text not null,
+  case_type text,
+  sample_method text not null,
+  sample_reason text,
+  random_seed integer,
+  primary key (sample_id, case_id)
+);
+```
+
+推荐同时记录抽样清单：
+
+```sql
+create table eventlog_sample_manifest (
+  sample_id text primary key,
+  sample_method text not null,
+  sample_unit text not null,
+  requested_case_count integer,
+  actual_case_count integer,
+  actual_event_count integer,
+  random_seed integer,
+  filter_condition text,
+  created_at timestamp default now(),
+  comment text
+);
+```
+
+默认抽样 2000 个 case：
+
+```sql
+insert into eventlog_sample_case (
+  sample_id,
+  case_id,
+  case_type,
+  sample_method,
+  sample_reason,
+  random_seed
+)
+select
+  :sample_id,
+  c.case_id,
+  c.case_type,
+  'case_random',
+  '默认抽样 2000 个 case',
+  :random_seed
+from (
+  select distinct case_id, case_type
+  from eventlog
+  where case_id is not null
+) c
+order by md5(c.case_id || ':' || cast(:random_seed as text))
+limit coalesce(:requested_case_count, 2000);
+```
+
+导出抽样 eventlog：
+
+```sql
+select e.*
+from eventlog e
+join eventlog_sample_case s
+  on s.sample_id = :sample_id
+ and s.case_id = e.case_id
+order by e.case_id, e.event_time, e.event_order, e.source_table, e.source_pk;
+```
+
+如果数据库不支持 `md5` 或上述语法，应使用目标数据库等价的稳定随机函数或脚本抽样，但仍要保证同一 `random_seed` 下样本可复现。
+
+行级预览仅用于检查 CSV 格式：
+
+```sql
+select *
+from eventlog
+order by case_id, event_time, event_order, source_table, source_pk
+limit :preview_row_count;
+```
+
+CSV 要求：
+
+```text
+文件名：eventlog.csv
+编码：UTF-8
+包含表头：是
+分隔符：英文逗号
+时间格式：推荐 ISO 格式
+排序：case_id, event_time, event_order, source_table, source_pk
+默认样本规模：2000 个 case
+默认抽样单位：case_id
+默认轨迹策略：保留抽中 case 的完整事件轨迹
+```
+
+导出后校验：
+
+```text
+eventlog.csv 文件存在
+CSV 有表头
+如果用户未指定抽样规模，CSV 覆盖默认 2000 个 case；如果全量 case 少于 2000，则覆盖全部可用 case
+如果用户指定抽样 case 数，CSV 覆盖的 distinct case_id 等于用户要求；如果可用 case 不足，则覆盖全部可用 case
+CSV 行数等于抽中 case 的完整事件数，不要求等于 2000
+必备列存在：case_id、activity、event_time
+追溯列存在：source_table、source_pk、relation_confidence
+已记录 sample_method、sample_unit、requested_case_count、actual_case_count、actual_event_count、random_seed
+```
+
+## 11. 质量校验
+
+解释流程图前先做校验：
+
+```sql
+-- activity 分布
+select activity, count(*) as event_count, count(distinct case_id) as case_count
+from eventlog
+group by activity
+order by event_count desc;
+
+-- case 轨迹长度
+select case_id, count(*) as event_count, min(event_time), max(event_time)
+from eventlog
+group by case_id
+order by event_count desc
+limit 50;
+
+-- 同一来源重复生成事件
+select source_table, source_pk, activity, count(*)
+from eventlog
+group by source_table, source_pk, activity
+having count(*) > 1
+order by count(*) desc;
+
+-- 关系置信度分布
+select relation_confidence, source_table, count(*)
+from eventlog
+group by relation_confidence, source_table
+order by relation_confidence, source_table;
+
+-- 关键列填充率
+select
+  count(*) filter (where case_id is not null) as with_case_id,
+  count(*) filter (where activity is not null) as with_activity,
+  count(*) filter (where event_time is not null) as with_event_time,
+  count(*) filter (where resource_id is not null) as with_resource,
+  count(*) as total_events
+from eventlog;
+
+-- 抽样结果规模
+select
+  count(distinct e.case_id) as sampled_case_count,
+  count(*) as sampled_event_count,
+  min(e.event_time) as sample_min_event_time,
+  max(e.event_time) as sample_max_event_time
+from eventlog e
+join eventlog_sample_case s
+  on s.sample_id = :sample_id
+ and s.case_id = e.case_id;
+
+-- 可疑 activity：过泛、纯编码、直接使用当前状态值
+select source_table, activity, count(*)
+from eventlog
+where activity in ('更新', '修改', '处理', '操作', '同步')
+   or activity ~ '^[0-9]+$'
+   or activity in ('approved', 'draft', 'processing', 'closed', 'done')
+group by source_table, activity
+order by count(*) desc;
+
+-- activity 是否过度碎片化
+select
+  count(distinct activity) as activity_count,
+  count(*) as event_count,
+  count(distinct activity)::numeric / nullif(count(*), 0) as activity_event_ratio
+from eventlog;
+
+-- object type 属性可获取性分布
+select
+  object_type,
+  availability_status,
+  count(*) as attribute_count,
+  count(*) filter (where required) as required_attribute_count,
+  min(nonnull_rate) as min_nonnull_rate
+from eventlog_object_attribute_map
+group by object_type, availability_status
+order by object_type, availability_status;
+
+-- object type 属性缺口
+select
+  object_type,
+  attribute_name,
+  eventlog_source,
+  extraction_rule,
+  availability_status,
+  gap_reason
+from eventlog_object_attribute_map
+where availability_status in ('missing', 'partial', 'requires_join')
+order by object_type, attribute_name;
+```
+
+重点排查：
+
+```text
+缺失时间戳
+case_id 为空
+activity 过碎或过泛
+多对多 join 造成超长 case
+低置信度关系混入主日志
+当前状态被误当成历史事件
+有业务含义字段只藏在 attributes 中，没有提升为可筛选的属性列
+object type 业务属性只停留在“应该有”，没有验证能否从 eventlog 获取
+object type 属性需要回连源表，却被误标记为 eventlog 已具备属性
+抽样 case 数和用户要求不一致
+把行级预览文件误当成流程挖掘样本
+抽样样本在时间、组织、业务类型或 case 轨迹长度上明显偏斜
+```
+
+## 输出报告模板
+
+回答用户时按以下结构输出：
+
+1. **流程目标和 case 设计**：分析什么流程，选择什么 case 粒度。
+2. **源表角色划分**：哪些是主表、历史表、审批表、明细表、维度表。
+3. **逻辑关系发现**：候选键、覆盖率、关系置信度。
+4. **Case Bridge 设计**：每个来源表如何映射到 case。
+5. **Activity 生成规则**：来源表、时间字段、activity、resource、status。
+6. **属性列完整性设计**：源表字段清单、哪些字段提升为 eventlog 属性列、哪些留在 `attributes`、哪些排除或脱敏。
+7. **Object Type 业务属性清单**：每个 object type 的对象 ID 规则、应包含的业务属性、属性含义、数据类型和取值规则。
+8. **Object Type 属性可获取性验证**：逐项说明属性来自哪个 eventlog 列或 `attributes` key，如何聚合为对象级属性，非空率、冲突情况、验证 SQL、缺口原因。
+9. **Eventlog Schema**：最低必备列 + 动态扩展业务属性列，说明列名、类型、用途和来源字段。
+10. **生成 SQL/脚本策略**：分阶段生成，不写难以审查的超大 SQL。
+11. **抽样方案**：抽样单位、默认或用户指定 case 数、抽样方法、随机种子、过滤条件、实际 case 数和实际 event 行数。
+12. **CSV 导出方案**：`eventlog.csv` 路径、抽样规则、排序规则，说明这是抽样数据而不是全量数据。
+13. **质量校验**：覆盖率、重复、缺失时间、低置信度 join、样本 case 数、样本 event 行数、object type 属性可获取性。
+14. **风险和排除项**：弱关系、孤立 case、仅作为属性的字段、object type 属性缺口、抽样偏差。
+
+## 常见错误
+
+| 错误 | 更好的做法 |
+|---|---|
+| 假设同名字段就是有效 join | 计算覆盖率并核对业务语义 |
+| 直接把所有表 union 成事件 | 先建关系图和 case bridge |
+| 把当前状态字段当历史事件 | 找历史表、审计表或带时间的业务节点 |
+| 强行合并多个业务对象为一个 case | 设计多个 case 类型或 parent_case_id |
+| 忽略审批日志的流程类型 | 按 process_key/type 分支路由 |
+| 把所有字段塞进 JSON | 有分析价值的字段提升为 eventlog 属性列 |
+| 把推荐 schema 当成列数上限 | 推荐 schema 只是最低基线，应按源表业务字段扩展 |
+| 过度保守导致属性缺失 | 默认尽量保留业务字段，只有低价值/敏感/不稳定字段才排除 |
+| 过度入列导致宽表失控 | 先入列业务字段，再对长文本、payload、稀疏字段放入 attributes |
+| 罗列 object type 属性但不验证来源 | 每个属性都必须标明 eventlog 来源列、聚合规则、非空率和缺口原因 |
+| 把源表里有但 eventlog 里没有的字段写成对象属性 | 标记为 `missing` 或 `requires_join`，不要声称可从 eventlog 获取 |
+| 只给方案不导出 CSV | 最终必须生成 `eventlog.csv` |
+| 默认导出全量数据 | 默认抽样 2000 个 case 并导出完整轨迹，不再默认全量导出 |
+| 用 event 行 `limit` 当流程样本 | 先抽样 case，再导出抽中 case 的全部事件；行级 `limit` 只用于格式预览 |
+
+## 完成检查清单
+
+提交最终结果前确认：
+
+- 已明确流程目标和 case 粒度
+- 已分析候选键的空值率、distinct 数和唯一性
+- 已用覆盖率验证逻辑表关系
+- 已给每条关系标记 high/medium/low 置信度
+- 已建立或设计 case bridge
+- 每个 activity 都有来源表、来源主键、事件时间
+- 当前状态字段没有被误当成历史事件
+- 有业务含义的源字段已尽量提升为 eventlog 属性列
+- 推荐 eventlog schema 没有被当成列数上限
+- 每个来源表都有字段映射结论：入列、attributes、排除或脱敏
+- 未提升字段有理由，并放入 `attributes`、排除或脱敏
+- 如果输出涉及 object type，已罗列每个 object type 应含有的业务属性
+- 每个 object type 都有 object_id 生成规则和实例数验证
+- 每个 object type 属性都有 eventlog 来源列、`attributes` key 或确定性聚合规则
+- 已验证 object type 属性能否从 eventlog 获取，并记录非空率、冲突情况和样例值
+- 无法从 eventlog 获取的 object type 属性已标记为 `missing` 或 `requires_join`，没有作为已具备属性交付
+- eventlog 包含 `case_id`、`activity`、`event_time`
+- eventlog 包含 `source_table`、`source_pk`、`relation_path`、`relation_confidence`
+- 最终输出抽样后的 `eventlog.csv`
+- 如果用户未指定抽样规模，已默认抽样 2000 个 case；如果可用 case 少于 2000，则导出全部可用 case
+- 如果用户指定抽样 case 数，CSV 覆盖的 distinct case_id 符合要求；如果可用 case 不足，已说明实际 case 数
+- CSV 保留抽中 case 的完整事件轨迹，没有为了凑行数截断单个 case
+- 已记录 sample_method、sample_unit、requested_case_count、actual_case_count、actual_event_count、random_seed
+- 如果使用 event 行 `limit`，已明确标记为 row_preview，且没有把它当作流程挖掘样本
+- CSV 包含表头和必备列 `case_id`、`activity`、`event_time`
+- 已提供质量校验 SQL 或校验结果
