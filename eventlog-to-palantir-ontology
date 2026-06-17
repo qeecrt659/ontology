@@ -1,0 +1,398 @@
+---
+name: eventlog-to-palantir-ontology
+description: Use when the user provides Palantir Foundry Ontology definitions or asks to derive Ontology elements from process mining eventlog/event log data, CSV/XES/log tables, activity traces, case timelines, or audit events, especially when the required output is a Markdown report with Object Types, Link Types, Action Types, submission criteria, rules, Functions, Roles, Permissions, Interfaces, Object Sets, Value Types, and Mermaid graphs.
+---
+
+# Eventlog 转 Palantir Ontology
+
+## 概览
+
+使用用户提供的 Palantir Ontology 定义作为最高优先级事实来源，分析流程挖掘 eventlog 数据，提炼可落地复核的 Ontology 元素，并输出 Markdown 报告。保持通用建模，不引入任何行业、组织或业务专有假设；当语义无法从输入中证明时，明确标记为待确认。
+
+## 输入优先级
+
+按以下顺序建立事实基础：
+
+1. 用户提供的 Palantir Ontology 元素定义、字段说明、命名规范、边界规则、权限模型或示例。
+2. 用户提供的 eventlog 数据文件、表结构、字段说明、样本行或统计摘要。
+3. 用户提供的流程说明、活动字典、系统日志说明、审计表说明或列含义解释。
+4. 从 eventlog 中启发式推断出的关系、属性和行为。
+
+如果用户提供的 Ontology 定义与 eventlog 推断冲突，以用户定义为准，并在报告的“冲突与待确认项”中列出证据、影响范围和建议确认问题。不要用启发式推断覆盖用户明确给出的 Ontology 语义。
+
+## 分析流程
+
+1. 识别 eventlog 粒度：
+   - case 标识：流程实例、对象实例、事务实例或其他跟踪单位。
+   - activity 标识：事件名称、状态变化、用户操作、系统动作或生命周期节点。
+   - timestamp 标识：发生时间、创建时间、更新时间、完成时间或排序时间。
+   - resource 标识：执行者、系统、服务、角色、队列或组织单元。
+   - 非主列字段：除 case、activity、timestamp 三类主列以外的所有列，包括 resource、对象键、属性值、前后值、状态、金额、数量、分类、审批结果、原因、渠道、来源系统、关联键、队列、组织、风险、SLA、备注等。
+2. 做数据质量检查：
+   - 行数、case 数、activity 数、时间范围、重复事件、缺失值、乱序时间戳。
+   - 每个 case 的事件数量分布、开始/结束活动、变体数量和异常路径。
+   - 关键列的唯一性、非空率、基数、枚举值和疑似敏感字段。
+3. 深挖非主列字段画像：
+   - 主三列 case、activity、timestamp 只用于定位流程实例、动作语义和发生顺序；不要把它们当成业务 Property 直接堆进 rules，但可以用于 audit / lineage。
+   - 对每个非主列字段统计非空率、基数、枚举值、数值范围、分位数、时间分布、每个 activity 下的填充率、是否在同一 case 内变化、变化前后值、与下一 activity / 结束活动 / resource / 队列的相关性。
+   - 将字段分类为 Action 参数、被写入 Property、被校验 Property、状态/阶段字段、分支/路由条件、金额/数量阈值、对象主键或外键、Link Type 证据、Object Set 过滤条件、Role / Permission 证据、Function 输入/输出、audit / lineage 字段、敏感字段或技术字段。
+   - 对所有相关非主列字段给出进入或不进入 rules 的理由。只有明显无业务含义、重复派生、纯技术噪声或敏感且不应暴露的字段，才可排除，并在待确认项或建模建议中说明。
+   - 优先寻找条件流转证据：某字段取值或阈值是否稳定对应不同下一 activity、不同处理队列、不同 actor/resource、不同状态结果或不同结束路径。
+4. 从 eventlog 提炼 Ontology 候选：
+   - Object Type：用户会查询、分析、授权、操作或在流程中跟踪的稳定对象。
+   - Property：对象的状态、分类、时间、数值、文本、布尔值、枚举值、来源信息和审计信息。
+   - Link Type：有导航、解释、聚合、授权、执行或分析价值的对象间关系。
+   - Action Type：activity 中体现的可执行操作、状态推进、提交、回退、分派、确认、关闭等行为。
+   - Function：可复用计算、派生指标、校验、SLA、风险判断、路径摘要或对象集计算。
+   - Object Set：Action Type、Function、Interface 或权限规则要读取、筛选或修改的一组对象。
+   - Role / Permission：从 resource、队列、组织、活动边界和操作权限中推导的访问与执行约束。
+   - Interface：面向用户任务的视图、表单、详情页、列表页、工作台或审核体验。
+   - Value Type：枚举、单位、金额、比例、时间周期、坐标、风险等级、状态字典等可复用值类型。
+5. 对每个候选元素标注证据：
+   - 来源字段、样本值、频次、覆盖率、关联 activity、关联 case、时间模式。
+   - 与用户 Ontology 定义的一致性、冲突点和置信度。
+6. 输出 Markdown 报告，图使用 Mermaid 代码块，表格使用 Markdown 表格。
+
+## Action Type 要求
+
+每个 Action Type 必须包含 `submission criteria` 和 `rules`。不要只写“更新对象”这类笼统描述；必须明确该动作会修改、创建、链接、取消链接、计算、校验或触发哪些 Ontology 元素。
+
+对齐 Palantir Action Type 的 rules 语义：
+
+- `rules` 是把 Action 参数转换为 Ontology edits 或其他 Foundry effects 的逻辑。报告中要说明每条规则建议落到哪类 Palantir rule：创建对象、修改对象、创建或修改对象、删除对象、创建链接、删除链接、Interface 对象/链接规则、Function rule 或其他 side effect。
+- 普通 Ontology rules 用于可直接声明的创建、修改、删除对象和链接。对于一对多或一对一的外键型 link，不要写成普通创建/删除 link；应写成修改对象的外键 Property，并说明对应 Link Type 语义。
+- `Function rule` 用于引用 Ontology edit function；Function 的输入来自 Action 参数。只有当 rules 需要复杂分支、循环、多对象批量编辑、跨对象读取、动态阈值、复杂校验、复用计算或普通 rules 无法表达时，才建议 Function rule。
+- 如果建议使用 `Function rule`，必须标明它与其他 Ontology rules 互斥：不要同时并列配置普通 Ontology rules。报告中可以列出该 Function 内部应产生的对象、属性、链接和 audit edits，但要明确这些 edits 由 Function 统一实现。
+- 如果只是简单字段写入、固定状态转移或少量静态链接变更，优先建模为普通 Ontology rules，不要过度抽成 Function。
+
+`rules` 必须充分利用 eventlog 非主列字段。除 case、activity、timestamp 三类主列外，所有有业务含义或流程判别价值的列都要进入 Action Type 的规则分析：作为参数、写入值、状态转移依据、Link 证据、权限依据、Object Set 筛选、Function 输入、分支/路由条件或 audit / lineage。不要只根据 activity 名称生成 Action Type。
+
+Action Type 字段建议如下：
+
+| 字段 | 要求 |
+| --- | --- |
+| `name` | 人类可读的动作名称，来自 activity 语义或用户定义，不直接照抄技术列名。 |
+| `source_activities` | 支撑该动作的原始 activity 值、频次和样本 case。 |
+| `primary_object_type` | 该动作主要作用的 Object Type。 |
+| `affected_object_types` | 会被创建、修改、读取、归档或删除的 Object Type 列表。 |
+| `affected_link_types` | 会被创建、修改、删除、校验或读取的 Link Type 列表。 |
+| `affected_properties` | 会被写入、更新、清空、锁定、派生或校验的 Property 列表。 |
+| `affected_functions` | 会被调用、重算或依赖的 Function 列表。 |
+| `affected_object_sets` | 会被筛选、读取、更新或作为范围约束的 Object Set 列表。 |
+| `actor` | 可执行该动作的 Role、Permission、resource 或系统主体。 |
+| `non_primary_column_evidence` | 除 case、activity、timestamp 外，支撑该动作规则的字段画像、样本值、覆盖率、变化模式和分支证据。 |
+| `recommended_rule_type` | 建议的 Palantir rule 类型：普通 Ontology rules、Function rule、Interface rules 或 side effect，并说明选择原因。 |
+| `submission criteria` | 动作提交前必须满足的对象状态、必填字段、权限、时间、唯一性、关联关系、数据质量和校验条件。 |
+| `rules` | 动作执行时的写入规则、状态转移、对象/链接变更、校验失败处理、审计记录和后续触发。 |
+| `output_effects` | 动作完成后的对象状态、事件记录、通知、派生值、队列变化或下游可见结果。 |
+| `confidence` | high / medium / low，并说明依据。 |
+
+`submission criteria` 至少覆盖：
+
+- 目标对象是否存在、是否处于允许提交的状态。
+- 必填 Property 是否存在且格式有效。
+- 必要 Link Type 是否存在或满足数量约束。
+- 当前 actor 是否具备执行权限。
+- 是否满足时间窗口、顺序约束、唯一性约束或幂等条件。
+- 是否通过 Function 或校验规则计算出的前置检查。
+- eventlog 是否提供足够证据；证据不足时标记为“需要用户确认”。
+
+`rules` 至少覆盖：
+
+- 使用哪类 Palantir rule：普通 Ontology rules、Function rule、Interface rules 或 side effect；如果是 Function rule，说明普通 rules 不再并列配置。
+- 从哪些非主列字段生成 Action 参数：字段名、类型、样本值、必填性、默认值、枚举/范围、敏感性和来源 activity。
+- 修改哪些 Object Type：创建、更新、归档、删除、锁定或解锁。
+- 修改哪些 Property：字段名、写入来源、写入值、状态转移、前后值来源；必须尽量把 eventlog 非主列中的状态、金额、数量、分类、结果、原因、渠道、来源系统、队列、组织、风险、SLA、备注等可解释字段映射到 Property 写入、校验或派生规则。
+- 修改哪些 Link Type：创建链接、删除链接、变更关系方向、校验关系存在性；如果 Link 来自外键字段，写清是通过修改对象外键 Property 实现。
+- 调用或重算哪些 Function：Function 输入来自哪些非主列字段，输出写回哪些 Property、Link、Object Set 或 side effect。
+- 读取或更新哪些 Object Set：哪些非主列字段构成筛选条件、队列归属、处理范围或权限范围。
+- 表达哪些分支/路由条件：例如数值阈值、枚举取值、状态组合、结果字段、resource/队列组合如何决定下一状态、目标队列、下游 Action 或 Function 输出；证据必须来自 eventlog 的路径差异或用户说明，证据不足则标记为待确认。
+- 触发哪些 Interface 变化、任务队列变化、通知或审计事件。
+- 写入哪些 lineage / audit 信息，包括 actor、timestamp、source activity、case 标识、关键非主列字段快照、命中的分支规则和 Function 版本。
+
+## 元素提炼准则
+
+使用这些通用准则，避免把技术日志直接等同于 Ontology：
+
+- Object Type 应代表稳定、可复用、可被用户理解和操作的对象；不要把每个字段、枚举值或临时技术键都建成对象。
+- Property 应承载对象状态、描述、指标和审计属性；敏感字段要标记权限和脱敏建议。
+- Link Type 必须有语义价值；只为 join 而存在的技术关系应降级为数据映射或待确认关系。
+- Action Type 应表达用户或系统可执行行为；如果 activity 只是被动记录，也可以建成事件记录对象或审计属性，而不是动作。
+- Function 应服务于计算、校验、筛选、派生指标或自动化逻辑；不要把一次性人工解释写成 Function。
+- Role / Permission 要从执行者、活动边界、对象范围和动作权限中综合推断；不要只按 resource 字段取值机械生成角色。
+- Interface 应围绕任务体验组织，例如列表、详情、表单、审核、监控或配置；不要输出营销页或说明页。
+- Value Type 应复用跨对象的状态、等级、单位、金额、时间周期、枚举或度量类型。
+
+## Markdown 输出模板
+
+最终输出必须是 Markdown，并建议使用以下结构。若用户要求落盘，文件名可用 `palantir_ontology_from_eventlog.md`。
+
+````markdown
+# Palantir Ontology Eventlog 分析报告
+
+## 1. 输入与范围
+
+- Ontology 定义来源：
+- eventlog 来源：
+- 分析粒度：
+- 时间范围：
+- 关键字段映射：
+- 不纳入本次建模的内容：
+
+## 2. Eventlog 数据概览
+
+| 指标 | 值 | 说明 |
+| --- | --- | --- |
+| 事件行数 |  |  |
+| case 数 |  |  |
+| activity 数 |  |  |
+| 时间范围 |  |  |
+| resource 数 |  |  |
+| 主要数据质量问题 |  |  |
+
+### 2.1 非主列字段画像
+
+| 字段 | 类型/值域 | 非空率 | 基数/样本值 | 关联 activity | 变化模式 | rules 用途 | 待确认 |
+| --- | --- | ---: | --- | --- | --- | --- | --- |
+
+## 3. Ontology 元素总览
+
+| 元素类型 | 候选数量 | 主要来源 | 置信度摘要 |
+| --- | ---: | --- | --- |
+| Object Type |  |  |  |
+| Property |  |  |  |
+| Link Type |  |  |  |
+| Action Type |  |  |  |
+| Function |  |  |  |
+| Object Set |  |  |  |
+| Role / Permission |  |  |  |
+| Interface |  |  |  |
+| Value Type |  |  |  |
+
+## 4. Object Types
+
+| Object Type | 定义 | 关键属性 | 来源证据 | 置信度 | 待确认 |
+| --- | --- | --- | --- | --- | --- |
+
+## 5. Properties 与 Value Types
+
+| 所属 Object Type | Property | Value Type | 来源字段 | 写入/更新来源 | 权限或敏感性 | 置信度 |
+| --- | --- | --- | --- | --- | --- | --- |
+
+## 6. Link Types
+
+| Link Type | From Object | To Object | 关系语义 | 来源证据 | 基数 | 置信度 | 待确认 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+## 7. Action Types
+
+### 7.x [Action Type 名称]
+
+- 来源 activity：
+- 主要 Object Type：
+- 影响的 Object Type：
+- 影响的 Property：
+- 影响的 Link Type：
+- 影响的 Function：
+- 影响的 Object Set：
+- actor / Role / Permission：
+- 非主列字段证据：
+- 建议 Palantir rule 类型：
+- submission criteria：
+  - 
+- rules：
+  - Palantir rule 类型：
+  - Action 参数与字段来源：
+  - 修改 Object Type：
+  - 修改 Property：
+  - 修改 Link Type：
+  - 调用 Function：
+  - 读取或更新 Object Set：
+  - 分支/路由条件：
+  - Function rule 互斥说明：
+  - 写入 audit / lineage：
+- output effects：
+- 置信度：
+- 待确认：
+
+## 8. Functions 与 Object Sets
+
+| 名称 | 类型 | 实现方式 | 输入 | 输出 | 读取对象/属性 | 被哪些 Action 或 Interface 使用 | 置信度 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+
+## 9. Roles、Permissions 与 Interfaces
+
+| 元素 | 类型 | 适用对象/动作 | 规则来源 | 建议 | 置信度 |
+| --- | --- | --- | --- | --- | --- |
+
+## 10. Ontology Graphs
+
+### 10.1 元素总览图
+
+```mermaid
+flowchart LR
+  Eventlog[eventlog] --> Objects[Object Types]
+  Eventlog --> Actions[Action Types]
+  Objects --> Properties[Properties / Value Types]
+  Objects --> Links[Link Types]
+  Actions --> Rules[Submission Criteria / Rules]
+  Actions --> Functions[Functions]
+  Actions --> ObjectSets[Object Sets]
+  Roles[Roles / Permissions] --> Actions
+  Interfaces[Interfaces] --> Objects
+  Interfaces --> Actions
+```
+
+### 10.2 对象关系图
+
+```mermaid
+flowchart LR
+  ObjA[Object Type A] -- Link Type --> ObjB[Object Type B]
+```
+
+### 10.3 流程与 Action 图
+
+```mermaid
+flowchart LR
+  Start((Start)) --> A1[Action Type 1]
+  A1 --> A2[Action Type 2]
+  A2 --> End((End))
+```
+
+### 10.4 Action 影响图
+
+```mermaid
+flowchart LR
+  Action[Action Type] --> Criteria[submission criteria]
+  Action --> RuleType[Palantir rule 类型]
+  Action --> Columns[非主列字段证据]
+  Action --> RuleObj[修改 Object Type]
+  Action --> RuleProp[修改 Property]
+  Action --> RuleLink[修改 Link Type]
+  Action --> RuleFn[Function rule / 调用 Function]
+  Action --> Branch[分支 / 路由条件]
+  Action --> Audit[写入 audit / lineage]
+```
+
+### 10.5 权限与体验图
+
+```mermaid
+flowchart LR
+  Role[Role] --> Permission[Permission]
+  Permission --> Action[Action Type]
+  Interface[Interface] --> Action
+  Interface --> ObjectSet[Object Set]
+  ObjectSet --> Object[Object Type]
+```
+
+### 10.6 非主列字段到 Rules 映射图
+
+```mermaid
+flowchart LR
+  Columns[非主列字段] --> Params[Action 参数]
+  Columns --> Props[Property 写入 / 校验]
+  Columns --> Links[Link Type 证据]
+  Columns --> Sets[Object Set 筛选]
+  Columns --> FnInput[Function 输入]
+  Columns --> Branch[分支 / 路由条件]
+  Columns --> Audit[audit / lineage]
+  Params --> Rules[Action Type rules]
+  Props --> Rules
+  Links --> Rules
+  Sets --> Rules
+  FnInput --> Rules
+  Branch --> Rules
+  Audit --> Rules
+```
+
+### 10.7 条件分支与路由图
+
+```mermaid
+flowchart LR
+  Action[Action Type] --> Check{分支条件}
+  Check -->|条件 A| RouteA[目标状态 / 队列 A]
+  Check -->|条件 B| RouteB[目标状态 / 队列 B]
+  Check -->|证据不足| Confirm[需要用户确认]
+  RouteA --> NextA[下游 Action A]
+  RouteB --> NextB[下游 Action B]
+```
+
+### 10.8 Action Rule 类型选择图
+
+```mermaid
+flowchart TD
+  Action[Action Type] --> NeedComplex{是否需要复杂逻辑}
+  NeedComplex -->|否| Normal[普通 Ontology rules]
+  NeedComplex -->|是| FunctionRule[Function rule]
+  Normal --> ObjRule[创建 / 修改 / 删除对象]
+  Normal --> LinkRule[创建 / 删除链接]
+  Normal --> FKRule[通过外键 Property 表达 Link]
+  FunctionRule --> EditFn[Ontology edit function]
+  EditFn --> FnEdits[统一产生对象 / 属性 / 链接 / audit edits]
+  FunctionRule --> Exclusive[不并列配置普通 Ontology rules]
+```
+
+### 10.9 Object Type 与 Action Type 关系图
+
+```mermaid
+flowchart LR
+  subgraph Objects[Object Types]
+    ObjA[Object Type A]
+    ObjB[Object Type B]
+    EventObj[ProcessEvent / Audit Event]
+  end
+
+  subgraph Actions[Action Types]
+    ActionA[Action Type 1]
+    ActionB[Action Type 2]
+  end
+
+  ActionA -->|创建 / 修改| ObjA
+  ActionA -.->|读取 / 校验| ObjB
+  ActionA -.->|写入 audit / lineage| EventObj
+  ActionB -->|创建 / 修改| ObjB
+  ActionB -.->|读取 / 派生 / 触发| ObjA
+  ActionB -.->|写入 audit / lineage| EventObj
+```
+
+## 11. 冲突与待确认项
+
+| 问题 | 证据 | 影响的 Ontology 元素 | 建议确认方式 | 优先级 |
+| --- | --- | --- | --- | --- |
+
+## 12. 建模建议
+
+- 
+````
+
+## Mermaid 图要求
+
+报告中的图必须使用 Mermaid，并尽量保持可渲染。每张图只表达一个问题：
+
+- 元素总览图：展示 eventlog 如何映射到 Object Type、Action Type、Function、Role、Interface 等。
+- 对象关系图：展示 Object Type 与 Link Type 的语义关系。
+- 流程与 Action 图：展示 activity 顺序、主要变体和 Action Type 候选。
+- Action 影响图：展示每个 Action Type 的 submission criteria、rules 和受影响元素。
+- 权限与体验图：展示 Role、Permission、Interface、Object Set、Action Type 和 Object Type 的关系。
+- 非主列字段到 Rules 映射图：展示除 case、activity、timestamp 外的字段如何进入 Action 参数、Property、Link Type、Object Set、Function、分支条件和 audit / lineage。
+- 条件分支与路由图：展示字段取值、阈值、状态组合或结果字段如何决定目标状态、目标队列和下游 Action；证据不足的分支必须标记为需要用户确认。
+- Action Rule 类型选择图：展示每个 Action Type 建议使用普通 Ontology rules 还是 Function rule，并明确 Function rule 与普通 Ontology rules 的互斥关系。
+- Object Type 与 Action Type 关系图：展示每个 Action Type 对 Object Type 的创建、修改、读取、校验、派生、触发和审计写入关系；实线表示创建/修改，虚线表示读取/校验/派生/触发；必须显示 `ProcessEvent` 或等价事件/审计对象如何承接 audit / lineage，并为关键边标注语义。
+
+节点名称使用用户可读名称；如果只能使用占位名称，使用 `Object Type A`、`Action Type 1` 这类中性名称，不引入业务场景词汇。边标签写清语义，例如 `读取`、`修改`、`创建链接`、`校验`、`授权执行`。
+
+## 质量门槛
+
+输出前自查：
+
+- 是否完全使用 Markdown 输出。
+- 是否引用并优先遵循用户提供的 Palantir Ontology 定义。
+- 是否没有引入输入中不存在的业务场景、行业对象或组织假设。
+- 是否对每个关键元素给出来源证据和置信度。
+- 是否为每个 Action Type 写出 `submission criteria`。
+- 是否为每个 Action Type 充分画像并利用除 case、activity、timestamp 外的非主列字段。
+- 是否为每个 Action Type 的 `rules` 明确列出建议的 Palantir rule 类型、Action 参数来源、修改哪些 Object Type、Property、Link Type、Function、Object Set 或其他 Ontology 元素。
+- 如果建议 `Function rule`，是否说明其与普通 Ontology rules 互斥，并把对象、属性、链接和 audit edits 放在 Function 内部实现说明中。
+- 是否从非主列字段中识别并说明可证明的分支/路由条件；证据不足时是否标记为待确认。
+- 是否至少包含元素总览图、对象关系图、流程与 Action 图、Action 影响图、权限与体验图、非主列字段到 Rules 映射图、条件分支与路由图、Action Rule 类型选择图、Object Type 与 Action Type 关系图。
+- 是否将冲突、低置信度推断和待用户确认项集中列出。
