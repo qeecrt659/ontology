@@ -1,0 +1,188 @@
+---
+name: extract-ontology-csvs-from-eventlog
+description: Use when 需要根据 eventlog、事件日志、流程日志、CSV/XES/Excel/JSON 日志表和 ontology 定义，为 ontology 的对象、关系、动作、值域或其他元素抽取实例数据，并为每个 ontology 元素生成独立 CSV 文件。
+---
+
+# 从 Eventlog 抽取 Ontology 元素 CSV
+
+## 核心原则
+
+从用户提供的 eventlog 和 ontology 元素定义中抽取可验证的数据实例。每个 ontology 元素输出一个独立 CSV；不要编造 eventlog 中不存在的数据；不要把处理脚本作为交付物；最终交付 CSV 文件或 CSV 内容、映射说明和必要的数据质量说明。
+
+## 输入确认
+
+先确认并读取这些信息：
+
+1. eventlog 数据：可来自 CSV、XES、Excel、JSON、数据库导出、Markdown 表格或用户粘贴的样本。
+2. ontology 定义：识别每个元素的名称、类型、主键、属性、关系端点、动作语义、时间字段、枚举值和必填约束。
+3. 用户期望：输出目录、文件命名、是否保留源字段、是否需要空表、是否需要中文列名或 ontology 原始属性名。
+
+如果输入缺少关键字段但仍能推进，先做显式假设并继续；只有在无法判断主键、关系端点或事件过滤条件时，才提出简短澄清问题。
+
+## 标准工作流
+
+1. 盘点 eventlog 字段。
+   识别 `case_id`、`activity`、`timestamp`、`resource`、`lifecycle`、事件 ID、业务对象 ID、状态、金额、组织、地点和其他属性列。记录字段类型、空值情况和可作为主键或外键的候选列。
+
+2. 盘点 ontology 元素。
+   建立元素清单，至少包含：`element_name`、`element_type`、`required_properties`、`optional_properties`、`identifier_rule`、`source_event_filter`、`dedupe_rule`、`output_file`。如果元素是 Action Type，还必须抽取该 Action 的全部 `submission criteria`、全部 `rules`、Rule 类型、涉及的 Object Types、影响的 Properties、影响的 Link Types、调用的 Functions、读取或更新的 Object Sets、actor/Role/Permission、分支条件和 output effects。
+
+3. 建立抽取映射。
+   为每个 ontology 元素写出：
+   - 从哪些 eventlog 行抽取：按 activity、事件类型、状态变化、case 范围或属性条件过滤。
+   - 从哪些 eventlog 列取值：直接映射、重命名、常量、枚举归一化或由多个字段组合。
+   - 如何生成主键：优先使用 eventlog 中稳定业务 ID；其次使用组合键；最后使用可追溯的派生键。
+   - 如何处理重复：按主键去重，选择最早事件、最新事件或保留所有事件实例，并说明依据。
+   - 如何处理缺失：保留空值并报告；不要猜测补全。
+
+4. 按元素类型抽取 CSV。
+   Object Type 输出一个对象实例表；Link Type 输出关系实例表；Action/Event Type 输出事件或动作实例表，并在每一行中包含该 Action 的完整规则定义、submission criteria 和涉及对象信息；Value Type 输出枚举或值域表；其他 metadata 型元素输出定义元数据或空表，并标记无法从 eventlog 得到实例数据。
+
+5. 校验输出。
+   检查每个 CSV 的表头、主键唯一性、必填字段空值、时间格式、关系端点可解析性、行数是否与过滤条件一致。发现问题时修正映射；无法修正时在最终说明中列出。
+
+## 元素抽取规则
+
+### Object Type
+
+每行代表一个对象实例，例如订单、客户、工单、设备、付款、发票、审批单。
+
+默认列：
+- 主键列：使用 ontology 定义中的 ID 属性名；若没有定义，使用 `id`。
+- 属性列：按 ontology 属性定义输出。
+- 可追溯列：必要时加入 `source_case_id`、`source_event_id`、`source_activity`、`source_timestamp`。
+
+规则：
+- 同一对象在多条事件中出现时，按对象 ID 去重。
+- 静态属性优先取非空且一致的值。
+- 状态、阶段、余额等会变化的属性必须说明取值时点，例如最新事件、首次创建事件或指定 activity。
+- 没有可靠对象 ID 时，使用业务组合键，例如 `case_id + object_name`，并在最终说明中标记为派生键。
+
+### Link Type
+
+每行代表两个对象之间的一条关系，例如订单-客户、工单-设备、发票-付款。
+
+默认列：
+- `source_id`
+- `target_id`
+- ontology 定义中的关系属性
+- 必要的可追溯列
+
+规则：
+- 只输出端点都能从 eventlog 解析的关系。
+- 关系主键默认为 `source_id + target_id + relation_type`，需要保留多次关系事件时再加入 `timestamp` 或 `event_id`。
+- 不要为了补齐关系端点而生成不存在的对象实例。
+
+### Action Type 或 Event Type
+
+每行代表一次动作、事件或状态变化，例如提交申请、审批通过、付款完成、派单。
+
+默认列：
+- `action_id` 或 `event_id`
+- `case_id`
+- `activity`
+- `timestamp`
+- `resource`
+- ontology 定义中的动作属性
+
+Action CSV 还必须包含这些定义型列；这些列来自 ontology 定义，不是从 eventlog 猜测：
+
+- `action_name`
+- `action_api_name`
+- `primary_object_type`
+- `primary_object_id`
+- `involved_object_types`
+- `involved_object_ids`
+- `affected_object_types`
+- `affected_properties`
+- `affected_link_types`
+- `called_functions`
+- `read_or_updated_object_sets`
+- `actor_roles_permissions`
+- `rule_type`
+- `submission_criteria`
+- `rules`
+- `branch_conditions`
+- `function_rule_exclusivity`
+- `output_effects`
+- `rule_source_basis`
+
+其中 `submission_criteria` 必须完整保留 ontology 文档中该 Action 的全部提交条件；`rules` 必须完整保留该 Action 的全部规则，包括普通 Ontology rules、Function rule、修改 Object Type、修改 Property、修改 Link Type、调用 Function、读取或更新 Object Set、分支/路由条件、写入 audit / lineage 等条目。不要只输出规则摘要。
+
+规则：
+- 通常不去重，除非 eventlog 存在完全重复事件。
+- 保留动作发生时间、执行人、所属 case 和关联对象 ID。
+- 如果 ontology 动作名与 eventlog activity 名不同，明确记录映射关系。
+- Action CSV 必须同时保留定义层对象和实例层对象：`involved_object_types` 写入 ontology 中该 Action 的主要 Object Type、影响的 Object Type 和可选对象；`involved_object_ids` 写入当前 eventlog 行能解析出的对象实例 ID。能解析多个对象时用稳定分隔符或 JSON 数组保存，不能解析的实例 ID 留空，不要编造。
+- 如果一个 Action 的 rules 很长，仍写入同一个 Action CSV 的定义型列中，允许使用 CSV 转义后的多行文本或 JSON 文本；不要把 rules 拆到最终交付之外，除非用户明确要求额外生成规则明细表。
+- 如果 ontology 文档没有给出某个 Action 的 rules 或 submission criteria，必须在对应列写明 `metadata_missing`，并在数据质量说明中列出缺口。
+- Function rule 与普通 rules 互斥时，必须在 `function_rule_exclusivity` 中保留原始约束，避免下游误以为两类规则可以并列执行。
+
+### Value Type 或枚举元素
+
+每行代表一个可枚举值或标准化值，例如状态、渠道、优先级、地区。
+
+默认列：
+- `value`
+- `label`
+- `source_column`
+- `source_count`
+
+规则：
+- 从相关 eventlog 列提取 distinct 值。
+- 合并明显同义值前先说明归一化规则。
+- 不确定是否同义时保留原值。
+
+### 非实例型元素
+
+Interface、Function、Role、Permission、Rule 等元素通常不是 eventlog 实例数据。用户要求每个 ontology 元素都生成 CSV 时，也要为这些元素生成一个独立 CSV，但只写可验证的定义元数据：
+
+- `element_name`
+- `element_type`
+- `extraction_status`
+- `source_basis`
+- `notes`
+
+`extraction_status` 使用 `extracted`、`metadata_only`、`empty_no_source` 三类。不要把界面、权限或函数定义硬解释成业务事件。
+
+## CSV 输出约定
+
+默认每个 ontology 元素一个文件：
+
+```text
+<element_name>.csv
+```
+
+文件名需要去掉路径非法字符，空格转为 `_`，同名元素追加类型后缀，例如 `Order_ObjectType.csv`。
+
+CSV 内容要求：
+- 使用 UTF-8。
+- 第一行必须是表头。
+- 列名优先使用 ontology 定义中的属性名。
+- 空值留空，不写 `unknown`、`N/A` 或猜测值。
+- 时间统一为 ISO 8601；无法可靠转换时保留原值并说明。
+- 文本中的逗号、换行、引号按 CSV 规则转义。
+- 每个 CSV 只包含该 ontology 元素的数据，不混入其他元素。
+
+## 最终交付格式
+
+交付时列出：
+
+1. 生成的 CSV 文件清单：元素名、元素类型、文件名、行数、主键规则。
+2. 映射摘要：eventlog 字段如何映射到 ontology 属性。
+3. Action Type 覆盖说明：每个 Action CSV 是否包含完整 `submission_criteria`、完整 `rules` 和所有涉及对象；若缺失，列出缺失的 Action 和字段。
+4. 数据质量说明：空值、重复、无法解析关系、metadata-only 或 empty CSV。
+5. 关键假设：任何影响抽取结果的默认选择。
+
+如果用户只需要 CSV 文件，不要输出冗长解释；保留简短清单和必要警告即可。
+
+## 常见错误
+
+- 不要把 case 当成所有对象的唯一主键；case 可能包含多个业务对象。
+- 不要把 activity 名直接当作 ontology 元素名；先根据 ontology 定义建立语义映射。
+- 不要为关系 CSV 输出缺失端点的行，除非用户明确要求保留异常记录。
+- 不要把每条事件都复制到每个 Object Type CSV；对象表应按对象实例去重。
+- 不要因为 ontology 中有元素就编造实例；没有 eventlog 来源时输出空表或 metadata-only 表并说明。
+- 不要输出 Python、SQL 或其他处理代码作为交付物，除非用户明确要求实现脚本。
+- 不要只在说明文档里描述 Action rules；Action CSV 本身必须包含完整 rules、submission criteria 和涉及对象信息。
+- 不要只输出 Action 的主要对象；ontology 定义中列出的主要对象、影响对象、可选对象和可解析出的实例对象都要进入 Action CSV。
