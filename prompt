@@ -1,0 +1,11 @@
+$eventlog-builder  根据postgreSQL生产配置中的所有是数据库表中的数据，以及根据这些数据表的ER图文件 docs\crmFinal.md ，每一种case_type至少有20个案例，case_type要尽量多，总case数量尽量为2000个，给我生成eventlog
+
+$eventlog-builder  根据postgreSQL生产配置中的所有是数据库表中的数据，以及根据这些数据表的ER图文件"docs/CRM_ER.md",给我生成eventlog，eventlog里要涉及到
+customer,opportunity,bid,order, 他们都需要能互相关联上，其中customer就一个case, 正对这个customer可以找2个opportunities(那么就有2个opportunities的case)，然后
+该opportunities会有多个bid，那么就会有多个bid的cases，然后bid会有多个order，那么会有多个order的cases。
+
+
+$eventlog-to-palantir-ontology 根据eventlog的数据: outputs\eventlog.csv，生成ontology，输出为md格式
+
+
+需求：基于 docs\palantir_ontology_from_eventlog.md 中ontology的object type和link type中的定义，对数据outputs\eventlog.csv进行object和link的数据抽取，注意object里的属性值也要抽取，输出成csv格式
